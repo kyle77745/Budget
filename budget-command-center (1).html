@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Budget Command Center</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💰</text></svg>" />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a18; color: #e0e0f0; font-family: 'DM Sans', 'Segoe UI', sans-serif; }
+  input, select { font-family: 'DM Sans', sans-serif; background: #16162a; border: 1px solid #333355; color: #e0e0f0; padding: 6px 10px; border-radius: 6px; font-size: 13px; outline: none; }
+  input:focus, select:focus { border-color: #5577ff; }
+  select { cursor: pointer; }
+  button { font-family: 'DM Sans', sans-serif; cursor: pointer; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; transition: all 0.15s ease; }
+  button:hover { filter: brightness(1.15); }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #333355; border-radius: 3px; }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useEffect, useRef, createContext, useContext } = React;
+
+const JSONBIN_API = "https://api.jsonbin.io/v3";
+
+class CloudSync {
+  constructor() {
+    this.apiKey = null; // Only populated after unlock
+    this.binId = localStorage.getItem("budget_cloud_binid") || null;
+    this.saveTimeout = null;
+  }
+  get isConfigured() { return !!(this.apiKey && this.binId); }
+  configure(apiKey, binId) {
+    this.apiKey = apiKey; this.binId = binId;
+    // Only bin ID stored in plaintext — API key is encrypted separately
+    if (binId) localStorage.setItem("budget_cloud_binid", binId);
+  }
+  async encryptAndStore(apiKey, password) {
+    const encrypted = await CRYPTO.encrypt(apiKey, password);
+    localStorage.setItem("budget_cloud_apikey_enc", encrypted);
+    localStorage.removeItem("budget_cloud_apikey"); // remove any legacy plaintext key
+  }
+  async decryptKey(password) {
+    const encrypted = localStorage.getItem("budget_cloud_apikey_enc");
+    if (!encrypted) {
+      // Check for legacy plaintext key and migrate it
+      const legacy = localStorage.getItem("budget_cloud_apikey");
+      if (legacy) return legacy;
+      throw new Error("No stored key found");
+    }
+    return await CRYPTO.decrypt(encrypted, password);
+  }
+  get hasEncryptedKey() {
+    return !!(localStorage.getItem("budget_cloud_apikey_enc") || localStorage.getItem("budget_cloud_apikey"));
+  }
+  clearConfig() {
+    this.apiKey = null; this.binId = null;
+    localStorage.removeItem("budget_cloud_apikey");
+    localStorage.removeItem("budget_cloud_apikey_enc");
+    localStorage.removeItem("budget_cloud_binid");
+  }
+  async createBin(data) {
+    const res = await fetch(`${JSONBIN_API}/b`, { method: "POST", headers: { "Content-Type": "application/json", "X-Master-Key": this.apiKey, "X-Bin-Name": "budget-command-center", "X-Bin-Private": "true" }, body: JSON.stringify(data) });
+    if (!res.ok) throw new Error(`Create failed: ${res.status}`);
+    const result = await res.json();
+    this.binId = result.metadata.id;
+    localStorage.setItem("budget_cloud_binid", this.binId);
+    return result;
+  }
+  async load() {
+    if (!this.isConfigured) return null;
+    const res = await fetch(`${JSONBIN_API}/b/${this.binId}/latest`, { headers: { "X-Master-Key": this.apiKey } });
+    if (!res.ok) throw new Error(`Load failed: ${res.status}`);
+    return (await res.json()).record;
+  }
+  async save(data) {
+    if (!this.isConfigured) return;
+    const res = await fetch(`${JSONBIN_API}/b/${this.binId}`, { method: "PUT", headers: { "Content-Type": "application/json", "X-Master-Key": this.apiKey }, body: JSON.stringify(data) });
+    if (!res.ok) throw new Error(`Save failed: ${res.status}`);
+    return await res.json();
+  }
+  debouncedSave(data, delay = 1500) {
+    if (this.saveTimeout) clearTimeout(this.saveTimeout);
+    this.saveTimeout = setTimeout(() => this.save(data).catch(console.error), delay);
+  }
+}
+
+const cloudSync = new CloudSync();
+
+// ═══════════════════════════════════════════════════════════
+// CRYPTO — AES-GCM encryption with PBKDF2 key derivation
+// ═══════════════════════════════════════════════════════════
+
+const CRYPTO = {
+  async deriveKey(password, salt) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, keyMaterial, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  },
+  async encrypt(plaintext, password) {
+    const enc = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await this.deriveKey(password, salt);
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(plaintext));
+    const result = { salt: btoa(String.fromCharCode(...salt)), iv: btoa(String.fromCharCode(...iv)), data: btoa(String.fromCharCode(...new Uint8Array(ciphertext))) };
+    return JSON.stringify(result);
+  },
+  async decrypt(encrypted, password) {
+    const { salt, iv, data } = JSON.parse(encrypted);
+    const saltBuf = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+    const ivBuf = Uint8Array.from(atob(iv), c => c.charCodeAt(0));
+    const dataBuf = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+    const key = await this.deriveKey(password, saltBuf);
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: ivBuf }, key, dataBuf);
+    return new TextDecoder().decode(decrypted);
+  }
+};
+
+const STORAGE_VERSION = 1;
+const migrations = {};
+function migrateData(data, fromVersion) {
+  let current = data;
+  for (let v = fromVersion + 1; v <= STORAGE_VERSION; v++) { if (migrations[v]) current = migrations[v](current); }
+  return current;
+}
+
+const CATEGORIES = {
+  housing: { label: "Housing", color: "#E8553A" }, transport: { label: "Transport", color: "#F0943A" },
+  debt: { label: "Debt", color: "#D44060" }, essentials: { label: "Essentials", color: "#3A8FE8" },
+  financial: { label: "Savings & Investments", color: "#2ECC71" }, entertainment: { label: "Entertainment", color: "#9B59B6" },
+  services: { label: "Services & Tools", color: "#1ABC9C" }, health: { label: "Health", color: "#E67E22" },
+};
+const FREQUENCIES = ["monthly", "yearly", "weekly"];
+
+const defaultItems = [
+  { id: 1, name: "Rent", amount: 1475, category: "housing", frequency: "monthly", active: true },
+  { id: 2, name: "Utilities", amount: 200, category: "housing", frequency: "monthly", active: true },
+  { id: 3, name: "Internet", amount: 27.5, category: "housing", frequency: "monthly", active: true },
+  { id: 4, name: "Car Payment", amount: 613, category: "transport", frequency: "monthly", active: true },
+  { id: 5, name: "Car Insurance", amount: 272, category: "transport", frequency: "monthly", active: true },
+  { id: 6, name: "Gas", amount: 200, category: "transport", frequency: "monthly", active: true },
+  { id: 7, name: "Credit Card Payments", amount: 400, category: "debt", frequency: "monthly", active: true },
+  { id: 8, name: "OneMain", amount: 266, category: "debt", frequency: "monthly", active: true },
+  { id: 9, name: "Consolidated Debt", amount: 267, category: "debt", frequency: "monthly", active: true },
+  { id: 10, name: "Affirm (until June)", amount: 166.32, category: "debt", frequency: "monthly", active: true },
+  { id: 11, name: "Groceries", amount: 400, category: "essentials", frequency: "monthly", active: true },
+  { id: 12, name: "Phone", amount: 80, category: "essentials", frequency: "monthly", active: true },
+  { id: 13, name: "Lemonade (Renters Ins)", amount: 31, category: "essentials", frequency: "monthly", active: true },
+  { id: 14, name: "Investments", amount: 200, category: "financial", frequency: "monthly", active: true },
+  { id: 15, name: "Savings Account", amount: 200, category: "financial", frequency: "monthly", active: true },
+  { id: 16, name: "Netflix", amount: 22.99, category: "entertainment", frequency: "monthly", active: true },
+  { id: 17, name: "Hulu/Disney", amount: 11, category: "entertainment", frequency: "monthly", active: true },
+  { id: 18, name: "YouTube Premium", amount: 13.99, category: "entertainment", frequency: "monthly", active: true },
+  { id: 19, name: "Amazon Prime", amount: 14.99, category: "entertainment", frequency: "monthly", active: true },
+  { id: 20, name: "F1 TV", amount: 17.99, category: "entertainment", frequency: "monthly", active: true },
+  { id: 21, name: "iRacing", amount: 11.6, category: "entertainment", frequency: "monthly", active: true },
+  { id: 22, name: "Discord Nitro", amount: 13.48, category: "entertainment", frequency: "monthly", active: true },
+  { id: 23, name: "Gaming Budget", amount: 200, category: "entertainment", frequency: "monthly", active: true },
+  { id: 24, name: "Dropout", amount: 9, category: "entertainment", frequency: "monthly", active: true },
+  { id: 25, name: "Patreon", amount: 3, category: "entertainment", frequency: "monthly", active: true },
+  { id: 26, name: "GSuite", amount: 14.2, category: "services", frequency: "monthly", active: true },
+  { id: 27, name: "Squarespace", amount: 25, category: "services", frequency: "monthly", active: true },
+  { id: 28, name: "LegalZoom Agent", amount: 16.67, category: "services", frequency: "monthly", active: true },
+  { id: 29, name: "Namecheap", amount: 6.88, category: "services", frequency: "monthly", active: true },
+  { id: 30, name: "Domain", amount: 3.33, category: "services", frequency: "monthly", active: true },
+  { id: 31, name: "Google Storage", amount: 3.99, category: "services", frequency: "monthly", active: true },
+  { id: 32, name: "iCloud+", amount: 2.99, category: "services", frequency: "monthly", active: true },
+  { id: 33, name: "Mouse Sensitivity", amount: 2.99, category: "services", frequency: "monthly", active: true },
+  { id: 34, name: "Experian Credit", amount: 9.99, category: "services", frequency: "monthly", active: true },
+  { id: 35, name: "ACLU", amount: 10, category: "services", frequency: "monthly", active: true },
+  { id: 36, name: "AppleCare", amount: 13.49, category: "services", frequency: "monthly", active: true },
+  { id: 37, name: "Microsoft Gamepass", amount: 11.99, category: "entertainment", frequency: "monthly", active: true },
+  { id: 38, name: "Gym", amount: 200, category: "health", frequency: "monthly", active: true },
+  { id: 39, name: "One Medical", amount: 9, category: "health", frequency: "monthly", active: true },
+  { id: 40, name: "Oura Ring", amount: 4, category: "health", frequency: "monthly", active: true },
+  { id: 41, name: "iRobot", amount: 33, category: "housing", frequency: "monthly", active: true },
+  { id: 42, name: "Crunchyroll", amount: 9.99, category: "entertainment", frequency: "monthly", active: false },
+  { id: 43, name: "Mythical", amount: 5, category: "entertainment", frequency: "monthly", active: false },
+  { id: 44, name: "Adobe", amount: 59.99, category: "services", frequency: "monthly", active: false },
+  { id: 45, name: "Tangia", amount: 0, category: "services", frequency: "monthly", active: false },
+  { id: 46, name: "FlightRadar", amount: 2.83, category: "services", frequency: "monthly", active: true },
+];
+const defaultDebts = [
+  { id: 1, name: "Capital One", balance: 5000, payment: 1000, apr: null },
+  { id: 2, name: "Apple Card", balance: 200, payment: 100, apr: null },
+  { id: 3, name: "Partners", balance: 1976, payment: 200, apr: null },
+  { id: 4, name: "Citi", balance: 2464, payment: 200, apr: null },
+  { id: 5, name: "OneMain", balance: 4765, payment: 266, apr: null },
+];
+
+const INCOME_GROSS = 140000;
+const INCOME_NET_YEARLY = 92772;
+const INCOME_NET_MONTHLY = 7731;
+
+function toMonthly(a, f) { if (f === "yearly") return a / 12; if (f === "weekly") return a * (52 / 12); return a; }
+function fmt(n) { return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2 }).format(n); }
+
+const SyncContext = createContext(null);
+function SyncProvider({ children }) {
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [lastSync, setLastSync] = useState(null);
+  return (
+    <SyncContext.Provider value={{ syncStatus, lastSync, setSyncStatus, setLastSync }}>
+      {children}
+    </SyncContext.Provider>
+  );
+}
+
+function useCloudState(localKey, defaultValue) {
+  const sync = useContext(SyncContext);
+  const [state, setState] = useState(() => {
+    try { const raw = localStorage.getItem(localKey); if (raw) { const p = JSON.parse(raw); return p._data ?? p; } } catch (e) {}
+    return defaultValue;
+  });
+  const isFirst = useRef(true);
+
+  useEffect(() => {
+    if (!cloudSync.isConfigured) return;
+    (async () => {
+      try {
+        sync.setSyncStatus("syncing");
+        const cloud = await cloudSync.load();
+        if (cloud && cloud._data && cloud._data[localKey] !== undefined) {
+          const version = cloud._version ?? 0;
+          let data = cloud._data[localKey];
+          if (version < STORAGE_VERSION) data = migrateData(data, version);
+          setState(data);
+          localStorage.setItem(localKey, JSON.stringify({ _version: STORAGE_VERSION, _data: data }));
+        }
+        sync.setSyncStatus("synced");
+        sync.setLastSync(new Date());
+      } catch (e) { sync.setSyncStatus("offline"); }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (isFirst.current) { isFirst.current = false; return; }
+    localStorage.setItem(localKey, JSON.stringify({ _version: STORAGE_VERSION, _data: state }));
+    if (cloudSync.isConfigured) {
+      const payload = { _version: STORAGE_VERSION, _data: {} };
+      ["budget-items", "budget-debts"].forEach(k => {
+        try { const raw = localStorage.getItem(k); if (raw) payload._data[k] = JSON.parse(raw)._data ?? JSON.parse(raw); } catch (e) {}
+      });
+      payload._data[localKey] = state;
+      sync.setSyncStatus("syncing");
+      cloudSync.debouncedSave(payload);
+      setTimeout(() => { sync.setSyncStatus("synced"); sync.setLastSync(new Date()); }, 2000);
+    }
+  }, [state]);
+
+  return [state, setState];
+}
+
+function BarSegment({ segments, total }) {
+  return (<div style={{ display: "flex", height: 28, borderRadius: 6, overflow: "hidden", background: "#1a1a2e" }}>
+    {segments.map((s, i) => (<div key={i} title={`${s.label}: ${fmt(s.value)}`} style={{ width: `${(s.value / total) * 100}%`, background: s.color, transition: "width 0.4s ease", minWidth: s.value > 0 ? 2 : 0 }} />))}
+  </div>);
+}
+
+function SyncIndicator() {
+  const { syncStatus } = useContext(SyncContext);
+  if (!cloudSync.isConfigured) return (<span style={{ fontSize: 11, color: "#F0943A", display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: "#F0943A", display: "inline-block" }} />Local only</span>);
+  const colors = { idle: "#666", syncing: "#5577ff", synced: "#2ECC71", error: "#D44060", offline: "#F0943A" };
+  const labels = { idle: "Connected", syncing: "Syncing...", synced: "Synced", error: "Sync error", offline: "Offline" };
+  return (<span style={{ fontSize: 11, color: colors[syncStatus], display: "flex", alignItems: "center", gap: 4 }} title={cloudSync.binId ? `Bin: ${cloudSync.binId}` : ""}>
+    {syncStatus === "syncing" ? <span style={{ width: 10, height: 10, border: "2px solid #5577ff", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "spin 0.8s linear infinite" }} /> : <span style={{ width: 6, height: 6, borderRadius: "50%", background: colors[syncStatus], display: "inline-block" }} />}
+    🔐 {labels[syncStatus]} &middot; v{STORAGE_VERSION}
+  </span>);
+}
+
+function DebtTracker() {
+  const [debts, setDebts] = useCloudState("budget-debts", defaultDebts);
+  const [editingDebt, setEditingDebt] = useState(null);
+  const [addingDebt, setAddingDebt] = useState(false);
+  const [newDebt, setNewDebt] = useState({ name: "", balance: "", payment: "", apr: "" });
+  const [showStrategy, setShowStrategy] = useState(false);
+
+  const activeDebts = debts.filter(d => d.balance > 0);
+  const totalDebt = activeDebts.reduce((s, d) => s + d.balance, 0);
+  const totalPayments = activeDebts.reduce((s, d) => s + d.payment, 0);
+  const hasAnyApr = activeDebts.some(d => d.apr !== null && d.apr > 0);
+  const allHaveApr = activeDebts.length > 0 && activeDebts.every(d => d.apr !== null && d.apr > 0);
+  const monthlyInterest = activeDebts.reduce((s, d) => s + (d.apr ? (d.balance * (d.apr / 100) / 12) : 0), 0);
+  const avalancheOrder = [...activeDebts].filter(d => d.apr !== null && d.apr > 0).sort((a, b) => b.apr - a.apr);
+
+  const updateDebt = (id, field, value) => setDebts(prev => prev.map(d => { if (d.id !== id) return d; if (field === "apr") return { ...d, apr: value === "" ? null : parseFloat(value) || 0 }; return { ...d, [field]: field === "name" ? value : (parseFloat(value) || 0) }; }));
+  const deleteDebt = (id) => setDebts(prev => prev.filter(d => d.id !== id));
+  const addDebtItem = () => { if (!newDebt.name || !newDebt.balance) return; const maxId = Math.max(...debts.map(d => d.id), 0); setDebts(prev => [...prev, { id: maxId + 1, name: newDebt.name, balance: parseFloat(newDebt.balance) || 0, payment: parseFloat(newDebt.payment) || 0, apr: newDebt.apr ? parseFloat(newDebt.apr) : null }]); setNewDebt({ name: "", balance: "", payment: "", apr: "" }); setAddingDebt(false); };
+
+  return (
+    <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
+        <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#D44060" }}>Debt Tracker</h3>
+        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: "#D44060" }}>{fmt(totalDebt)}</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 70px 55px 70px", gap: 8, padding: "0 0 4px", fontSize: 10, textTransform: "uppercase", letterSpacing: 1, color: "#444466", fontWeight: 600 }}>
+          <span>Account</span><span style={{ textAlign: "right" }}>Balance</span><span style={{ textAlign: "right" }}>Payment</span><span style={{ textAlign: "right" }}>APR</span><span style={{ textAlign: "right" }}>Int/mo</span>
+        </div>
+        {activeDebts.map((d) => {
+          const isEd = editingDebt === d.id; const monthInt = d.apr ? (d.balance * (d.apr / 100) / 12) : null; const barPct = totalDebt > 0 ? (d.balance / totalDebt) * 100 : 0;
+          return (<div key={d.id} style={{ background: isEd ? "#16162e" : "transparent", borderRadius: 6, padding: isEd ? "8px" : "4px 0", transition: "all 0.15s" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 90px 70px 55px 70px", gap: 8, alignItems: "center" }}>
+              {isEd ? <input value={d.name} onChange={e => updateDebt(d.id, "name", e.target.value)} style={{ fontSize: 13, fontWeight: 500 }} /> : <span style={{ fontSize: 13, color: "#aaa", cursor: "pointer" }} onClick={() => setEditingDebt(d.id)}>{d.name}</span>}
+              {isEd ? <input type="number" step="0.01" value={d.balance} onChange={e => updateDebt(d.id, "balance", e.target.value)} style={{ fontSize: 12, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", width: "100%" }} /> : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: "#ddd", textAlign: "right", fontWeight: 600 }}>{fmt(d.balance)}</span>}
+              {isEd ? <input type="number" step="0.01" value={d.payment} onChange={e => updateDebt(d.id, "payment", e.target.value)} style={{ fontSize: 12, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", width: "100%" }} /> : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#777", textAlign: "right" }}>{fmt(d.payment)}</span>}
+              {isEd ? <input type="number" step="0.1" value={d.apr ?? ""} placeholder="—" onChange={e => updateDebt(d.id, "apr", e.target.value)} style={{ fontSize: 12, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", width: "100%" }} /> : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, textAlign: "right", color: d.apr ? (d.apr >= 20 ? "#E8553A" : d.apr >= 10 ? "#F0943A" : "#2ECC71") : "#333355" }}>{d.apr ? `${d.apr}%` : "—"}</span>}
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, textAlign: "right", color: monthInt ? "#E8553A" : "#333355" }}>{monthInt !== null ? fmt(monthInt) : "—"}</span>
+            </div>
+            <div style={{ height: 3, borderRadius: 2, background: "#1a1a2e", marginTop: 4, overflow: "hidden" }}><div style={{ width: `${barPct}%`, height: "100%", background: "#D44060", borderRadius: 2, transition: "width 0.3s" }} /></div>
+            {isEd && <div style={{ display: "flex", gap: 6, marginTop: 8 }}><button onClick={() => setEditingDebt(null)} style={{ background: "#2ECC71", color: "#000", padding: "4px 12px", fontSize: 11, fontWeight: 600 }}>Done</button><button onClick={() => { deleteDebt(d.id); setEditingDebt(null); }} style={{ background: "#2a1520", color: "#D44060", padding: "4px 12px", fontSize: 11 }}>Remove</button></div>}
+          </div>);
+        })}
+      </div>
+      {addingDebt ? (
+        <div style={{ background: "#16162e", borderRadius: 8, padding: 12, marginTop: 10, border: "1px solid #3355cc", display: "grid", gridTemplateColumns: "1fr 80px 80px 60px auto", gap: 8, alignItems: "flex-end" }}>
+          <div><label style={{ fontSize: 10, color: "#666", display: "block", marginBottom: 3 }}>Account</label><input value={newDebt.name} onChange={e => setNewDebt({ ...newDebt, name: e.target.value })} placeholder="e.g. Amex" style={{ width: "100%" }} autoFocus /></div>
+          <div><label style={{ fontSize: 10, color: "#666", display: "block", marginBottom: 3 }}>Balance</label><input type="number" value={newDebt.balance} onChange={e => setNewDebt({ ...newDebt, balance: e.target.value })} placeholder="0" style={{ width: "100%" }} /></div>
+          <div><label style={{ fontSize: 10, color: "#666", display: "block", marginBottom: 3 }}>Payment</label><input type="number" value={newDebt.payment} onChange={e => setNewDebt({ ...newDebt, payment: e.target.value })} placeholder="0" style={{ width: "100%" }} /></div>
+          <div><label style={{ fontSize: 10, color: "#666", display: "block", marginBottom: 3 }}>APR %</label><input type="number" step="0.1" value={newDebt.apr} onChange={e => setNewDebt({ ...newDebt, apr: e.target.value })} placeholder="—" style={{ width: "100%" }} /></div>
+          <div style={{ display: "flex", gap: 4 }}><button onClick={addDebtItem} style={{ background: "#2ECC71", color: "#000", padding: "6px 12px", fontSize: 11, fontWeight: 600 }}>Add</button><button onClick={() => setAddingDebt(false)} style={{ background: "#333", color: "#aaa", padding: "6px 8px", fontSize: 11 }}>✕</button></div>
+        </div>
+      ) : <button onClick={() => setAddingDebt(true)} style={{ background: "transparent", color: "#555577", padding: "8px 0", fontSize: 12, marginTop: 8, border: "1px dashed #333355", borderRadius: 6, width: "100%", textAlign: "center" }}>+ Add Debt Account</button>}
+      <div style={{ borderTop: "1px solid #262640", marginTop: 14, paddingTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}><span style={{ color: "#666" }}>Monthly payments toward debt</span><span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#aaa" }}>{fmt(totalPayments)}</span></div>
+        {hasAnyApr && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}><span style={{ color: "#666" }}>Monthly interest {allHaveApr ? "" : "(partial — add APRs)"}</span><span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#E8553A" }}>{fmt(monthlyInterest)}</span></div>}
+        {hasAnyApr && <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}><span style={{ color: "#666" }}>Net principal reduction/mo</span><span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2ECC71" }}>{fmt(totalPayments - monthlyInterest)}</span></div>}
+      </div>
+      {avalancheOrder.length >= 2 && (
+        <div style={{ marginTop: 12 }}>
+          <button onClick={() => setShowStrategy(!showStrategy)} style={{ background: "transparent", color: "#9B59B6", padding: 0, fontSize: 12, fontWeight: 500, textDecoration: "underline", textUnderlineOffset: 3 }}>{showStrategy ? "Hide" : "Show"} optimal payoff order</button>
+          {showStrategy && (<div style={{ marginTop: 10, background: "#0e0e1a", borderRadius: 8, padding: 14, border: "1px solid #262640" }}>
+            <div style={{ fontSize: 11, color: "#666", marginBottom: 10 }}>Avalanche method — highest APR first. Pay minimums on everything else, throw extra cash at #1.</div>
+            {avalancheOrder.map((d, i) => (<div key={d.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", borderBottom: i < avalancheOrder.length - 1 ? "1px solid #1a1a2e" : "none" }}>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, fontWeight: 700, color: i === 0 ? "#E8553A" : "#333355", width: 28 }}>{i + 1}</span>
+              <span style={{ flex: 1, fontSize: 13, color: i === 0 ? "#ddd" : "#777" }}>{d.name}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: i === 0 ? "#E8553A" : "#666" }}>{d.apr}% APR</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#555", width: 70, textAlign: "right" }}>{fmt(d.balance)}</span>
+            </div>))}
+          </div>)}
+        </div>
+      )}
+      {!hasAnyApr && <div style={{ marginTop: 12, padding: "10px 14px", background: "#1a1520", borderRadius: 6, border: "1px solid #332230", fontSize: 12, color: "#aa6688", lineHeight: 1.5 }}>Click any account to edit and add your APR. It's on your statements — 10 minutes of work unlocks interest cost tracking and optimal payoff ordering.</div>}
+    </div>
+  );
+}
+
+function SetupScreen({ onComplete }) {
+  const [apiKey, setApiKey] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [existingBinId, setExistingBinId] = useState("");
+  const [status, setStatus] = useState("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+  const [useExisting, setUseExisting] = useState(false);
+
+  const pwMatch = password === confirmPw;
+  const canSubmit = apiKey.trim() && password.length >= 4 && pwMatch;
+
+  const handleSetup = async () => {
+    if (!canSubmit) return;
+    setStatus("testing"); setErrorMsg("");
+    try {
+      cloudSync.configure(apiKey.trim(), null);
+      if (useExisting && existingBinId.trim()) {
+        cloudSync.configure(apiKey.trim(), existingBinId.trim());
+        await cloudSync.load();
+        await cloudSync.encryptAndStore(apiKey.trim(), password);
+        onComplete(); return;
+      }
+      setStatus("creating");
+      await cloudSync.createBin({ _version: STORAGE_VERSION, _data: { "budget-items": defaultItems, "budget-debts": defaultDebts } });
+      await cloudSync.encryptAndStore(apiKey.trim(), password);
+      onComplete();
+    } catch (e) { setStatus("error"); setErrorMsg(e.message || "Connection failed."); cloudSync.clearConfig(); }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0a18", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ maxWidth: 480, width: "100%" }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8, background: "linear-gradient(135deg, #e0e0f0, #8888cc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Budget Command Center</h1>
+        <p style={{ color: "#666688", fontSize: 14, marginBottom: 32, lineHeight: 1.6 }}>Connect to JSONBin for cloud sync — your data accessible from any device.</p>
+        <div style={{ background: "#12121f", borderRadius: 12, padding: 28, border: "1px solid #262640" }}>
+          <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16, color: "#ccc" }}>Cloud Setup</h2>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}>1. Go to <a href="https://jsonbin.io" target="_blank" rel="noopener" style={{ color: "#5577ff" }}>jsonbin.io</a> and create a free account</div>
+            <div style={{ fontSize: 12, color: "#888", marginBottom: 6 }}>2. Go to API Keys and copy your X-Master-Key</div>
+            <div style={{ fontSize: 12, color: "#888", marginBottom: 12 }}>3. Paste it below</div>
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 1 }}>API Key</label>
+            <input value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="$2a$10$..." style={{ width: "100%", padding: "10px 12px", fontSize: 14, fontFamily: "'JetBrains Mono', monospace" }} type="password" />
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 1 }}>Unlock Password</label>
+            <input value={password} onChange={e => setPassword(e.target.value)} placeholder="Min 4 characters" style={{ width: "100%", padding: "10px 12px", fontSize: 14 }} type="password" />
+            <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>You'll enter this each time you open the app to decrypt your API key.</div>
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4, textTransform: "uppercase", letterSpacing: 1 }}>Confirm Password</label>
+            <input value={confirmPw} onChange={e => setConfirmPw(e.target.value)} placeholder="Re-enter password" style={{ width: "100%", padding: "10px 12px", fontSize: 14, borderColor: confirmPw && !pwMatch ? "#D44060" : undefined }} type="password" />
+            {confirmPw && !pwMatch && <div style={{ fontSize: 11, color: "#D44060", marginTop: 4 }}>Passwords don't match</div>}
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#888", cursor: "pointer" }}>
+              <input type="checkbox" checked={useExisting} onChange={() => setUseExisting(!useExisting)} style={{ accentColor: "#5577ff" }} />
+              I have an existing bin ID (syncing another device)
+            </label>
+            {useExisting && <input value={existingBinId} onChange={e => setExistingBinId(e.target.value)} placeholder="Bin ID" style={{ width: "100%", padding: "10px 12px", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", marginTop: 8 }} />}
+          </div>
+          {errorMsg && <div style={{ background: "#2a1520", border: "1px solid #D44060", borderRadius: 6, padding: "8px 12px", fontSize: 12, color: "#D44060", marginBottom: 12 }}>{errorMsg}</div>}
+          <button onClick={handleSetup} disabled={!canSubmit || status === "testing" || status === "creating"} style={{ background: status !== "idle" && status !== "error" ? "#333" : "#3355cc", color: "#fff", padding: "10px 20px", fontWeight: 600, fontSize: 14, width: "100%", opacity: !canSubmit ? 0.5 : 1 }}>
+            {status === "testing" ? "Verifying..." : status === "creating" ? "Creating storage..." : useExisting ? "Connect" : "Set Up Cloud Sync"}
+          </button>
+          <div style={{ borderTop: "1px solid #262640", marginTop: 20, paddingTop: 16 }}>
+            <button onClick={() => { localStorage.setItem("budget_cloud_skipped", "true"); onComplete(); }} style={{ background: "transparent", color: "#444", fontSize: 12, padding: 0, textDecoration: "underline", textUnderlineOffset: 3 }}>Skip — use local storage only</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BudgetDashboard() {
+  const [items, setItems] = useCloudState("budget-items", defaultItems);
+  const [showInactive, setShowInactive] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [addingNew, setAddingNew] = useState(false);
+  const [newItem, setNewItem] = useState({ name: "", amount: "", category: "essentials", frequency: "monthly" });
+  const [filterCat, setFilterCat] = useState("all");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [sortBy, setSortBy] = useState("category");
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const activeItems = useMemo(() => items.filter(i => i.active), [items]);
+  const inactiveItems = useMemo(() => items.filter(i => !i.active), [items]);
+  const totalMonthly = useMemo(() => activeItems.reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0), [activeItems]);
+  const leftover = INCOME_NET_MONTHLY - totalMonthly;
+
+  const categoryTotals = useMemo(() => {
+    const t = {}; activeItems.forEach(i => { if (!t[i.category]) t[i.category] = 0; t[i.category] += toMonthly(i.amount, i.frequency); });
+    return Object.entries(CATEGORIES).map(([k, v]) => ({ key: k, ...v, totalMonthly: t[k] || 0, totalWeekly: (t[k] || 0) * 12 / 52 })).filter(c => c.totalMonthly > 0).sort((a, b) => b.totalMonthly - a.totalMonthly);
+  }, [activeItems]);
+
+  const weeklyIncome = INCOME_NET_MONTHLY * 12 / 52;
+  const weeklyLeftover = weeklyIncome - (totalMonthly * 12 / 52);
+
+  const displayItems = useMemo(() => {
+    let list = showInactive ? items : activeItems;
+    if (filterCat !== "all") list = list.filter(i => i.category === filterCat);
+    if (sortBy === "category") list = [...list].sort((a, b) => a.category.localeCompare(b.category) || b.amount - a.amount);
+    else if (sortBy === "amount") list = [...list].sort((a, b) => toMonthly(b.amount, b.frequency) - toMonthly(a.amount, a.frequency));
+    else if (sortBy === "name") list = [...list].sort((a, b) => a.name.localeCompare(b.name));
+    return list;
+  }, [items, activeItems, showInactive, filterCat, sortBy]);
+
+  const toggleActive = (id) => setItems(p => p.map(i => i.id === id ? { ...i, active: !i.active } : i));
+  const deleteItem = (id) => { setItems(p => p.filter(i => i.id !== id)); setConfirmDelete(null); };
+  const updateItem = (id, f, v) => setItems(p => p.map(i => i.id === id ? { ...i, [f]: f === "amount" ? parseFloat(v) || 0 : v } : i));
+  const addItem = () => { if (!newItem.name || !newItem.amount) return; const mx = Math.max(...items.map(i => i.id), 0); setItems(p => [...p, { ...newItem, id: mx + 1, amount: parseFloat(newItem.amount), active: true }]); setNewItem({ name: "", amount: "", category: "essentials", frequency: "monthly" }); setAddingNew(false); };
+
+  const resetAllData = () => {
+    localStorage.removeItem("budget-items"); localStorage.removeItem("budget-debts");
+    if (cloudSync.isConfigured) cloudSync.save({ _version: STORAGE_VERSION, _data: { "budget-items": defaultItems, "budget-debts": defaultDebts } }).catch(console.error);
+    window.location.reload();
+  };
+
+  const barSegments = categoryTotals.map(c => ({ label: c.label, value: c.totalWeekly, color: c.color }));
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0a18", color: "#e0e0f0", fontFamily: "'DM Sans', 'Segoe UI', sans-serif" }}>
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: "32px 20px" }}>
+        <div style={{ marginBottom: 32 }}>
+          <h1 style={{ margin: 0, fontSize: 28, fontWeight: 700, letterSpacing: -0.5, background: "linear-gradient(135deg, #e0e0f0, #8888cc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Budget Command Center</h1>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: "#555577", display: "flex", alignItems: "center", gap: 12 }}>
+            {fmt(INCOME_GROSS)} gross &rarr; {fmt(INCOME_NET_YEARLY)} net &rarr; {fmt(INCOME_NET_MONTHLY)}/mo take-home
+            <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+              <SyncIndicator />
+              <button onClick={() => setShowSettings(!showSettings)} style={{ background: "transparent", color: "#444", padding: "2px 6px", fontSize: 10, border: "1px solid #333" }}>⚙</button>
+            </span>
+          </p>
+          {showSettings && (
+            <div style={{ background: "#12121f", border: "1px solid #262640", borderRadius: 8, padding: 16, marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              {cloudSync.isConfigured && <span style={{ fontSize: 11, color: "#555", fontFamily: "'JetBrains Mono', monospace" }}>Bin: {cloudSync.binId}</span>}
+              <span style={{ flex: 1 }} />
+              {cloudSync.isConfigured && <button onClick={() => { cloudSync.clearConfig(); localStorage.removeItem("budget_cloud_skipped"); window.location.reload(); }} style={{ background: "#262640", color: "#aaa", padding: "4px 10px", fontSize: 11 }}>Disconnect cloud</button>}
+              {cloudSync.isConfigured && <button onClick={() => window.location.reload()} style={{ background: "#262640", color: "#F0943A", padding: "4px 10px", fontSize: 11 }}>🔒 Lock</button>}
+              {!cloudSync.isConfigured && <button onClick={() => { localStorage.removeItem("budget_cloud_skipped"); window.location.reload(); }} style={{ background: "#3355cc", color: "#fff", padding: "4px 10px", fontSize: 11, fontWeight: 600 }}>Set up cloud sync</button>}
+              {showResetConfirm ? (
+                <span style={{ display: "flex", gap: 4 }}>
+                  <button onClick={resetAllData} style={{ background: "#D44060", color: "#fff", padding: "4px 10px", fontSize: 11, fontWeight: 600 }}>Yes, reset everything</button>
+                  <button onClick={() => setShowResetConfirm(false)} style={{ background: "#333", color: "#aaa", padding: "4px 8px", fontSize: 11 }}>Cancel</button>
+                </span>
+              ) : <button onClick={() => setShowResetConfirm(true)} style={{ background: "#2a1520", color: "#D44060", padding: "4px 10px", fontSize: 11 }}>Reset all data</button>}
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 20 }}>
+          <div style={{ background: "#12121f", borderRadius: 10, padding: "18px 20px", border: "1px solid #262640" }}><div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688", marginBottom: 6 }}>Monthly Income</div><div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: "#2ECC71" }}>{fmt(INCOME_NET_MONTHLY)}</div></div>
+          <div style={{ background: "#12121f", borderRadius: 10, padding: "18px 20px", border: "1px solid #262640" }}><div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688", marginBottom: 6 }}>Monthly Outgoing</div><div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: "#E8553A" }}>{fmt(totalMonthly)}</div></div>
+          <div style={{ background: "#12121f", borderRadius: 10, padding: "18px 20px", border: leftover >= 0 ? "1px solid #262640" : "1px solid #D44060" }}><div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688", marginBottom: 6 }}>Leftover</div><div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover)}</div></div>
+        </div>
+
+        <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640", marginBottom: 12 }}>
+          <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Spending Breakdown (Weekly)</h3>
+          <BarSegment segments={barSegments} total={weeklyIncome} />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 18px", marginTop: 14 }}>
+            {categoryTotals.map(c => (<div key={c.key} onClick={() => setFilterCat(filterCat === c.key ? "all" : c.key)} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", opacity: filterCat === "all" || filterCat === c.key ? 1 : 0.35, transition: "opacity 0.2s" }}>
+              <div style={{ width: 10, height: 10, borderRadius: 3, background: c.color }} /><span style={{ fontSize: 12, color: "#aaa" }}>{c.label}</span><span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 600, color: c.color }}>{fmt(c.totalWeekly)}</span><span style={{ fontSize: 11, color: "#555" }}>({((c.totalWeekly / weeklyIncome) * 100).toFixed(0)}%)</span>
+            </div>))}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, opacity: 0.6 }}><div style={{ width: 10, height: 10, borderRadius: 3, background: "#1a1a2e", border: "1px solid #333" }} /><span style={{ fontSize: 12, color: "#666" }}>Unallocated</span><span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: "#666" }}>{fmt(weeklyLeftover)}/wk</span></div>
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 20 }}><DebtTracker /></div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+          <button onClick={() => setAddingNew(true)} style={{ background: "#3355cc", color: "#fff", padding: "8px 16px", fontWeight: 600 }}>+ Add Item</button>
+          <select value={sortBy} onChange={e => setSortBy(e.target.value)} style={{ padding: "8px 12px" }}><option value="category">Sort: Category</option><option value="amount">Sort: Amount</option><option value="name">Sort: Name</option></select>
+          <select value={filterCat} onChange={e => setFilterCat(e.target.value)} style={{ padding: "8px 12px" }}><option value="all">All Categories</option>{Object.entries(CATEGORIES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#888", marginLeft: "auto", cursor: "pointer" }}><input type="checkbox" checked={showInactive} onChange={() => setShowInactive(!showInactive)} style={{ accentColor: "#5577ff", width: 15, height: 15 }} />Show cancelled</label>
+        </div>
+
+        {addingNew && (
+          <div style={{ background: "#16162e", borderRadius: 10, padding: 16, marginBottom: 12, border: "1px solid #3355cc", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div style={{ flex: 2, minWidth: 140 }}><label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>Name</label><input value={newItem.name} onChange={e => setNewItem({ ...newItem, name: e.target.value })} placeholder="e.g. Spotify" style={{ width: "100%" }} autoFocus /></div>
+            <div style={{ flex: 1, minWidth: 90 }}><label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>Amount</label><input type="number" step="0.01" value={newItem.amount} onChange={e => setNewItem({ ...newItem, amount: e.target.value })} placeholder="9.99" style={{ width: "100%" }} /></div>
+            <div style={{ flex: 1, minWidth: 120 }}><label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>Category</label><select value={newItem.category} onChange={e => setNewItem({ ...newItem, category: e.target.value })} style={{ width: "100%" }}>{Object.entries(CATEGORIES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select></div>
+            <div style={{ flex: 1, minWidth: 100 }}><label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>Frequency</label><select value={newItem.frequency} onChange={e => setNewItem({ ...newItem, frequency: e.target.value })} style={{ width: "100%" }}>{FREQUENCIES.map(f => <option key={f} value={f}>{f}</option>)}</select></div>
+            <div style={{ display: "flex", gap: 6 }}><button onClick={addItem} style={{ background: "#2ECC71", color: "#000", padding: "8px 16px", fontWeight: 600 }}>Save</button><button onClick={() => setAddingNew(false)} style={{ background: "#333", color: "#aaa", padding: "8px 12px" }}>Cancel</button></div>
+          </div>
+        )}
+
+        <div style={{ background: "#12121f", borderRadius: 10, border: "1px solid #262640", overflow: "hidden" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "40px 1fr 110px 100px 90px 80px", padding: "10px 16px", borderBottom: "1px solid #262640", fontSize: 11, textTransform: "uppercase", letterSpacing: 1.2, color: "#555577", fontWeight: 600 }}><span></span><span>Item</span><span style={{ textAlign: "right" }}>Monthly</span><span style={{ textAlign: "center" }}>Category</span><span style={{ textAlign: "center" }}>Freq</span><span style={{ textAlign: "right" }}>Actions</span></div>
+          {displayItems.map(item => {
+            const cat = CATEGORIES[item.category]; const monthly = toMonthly(item.amount, item.frequency); const isEd = editingId === item.id;
+            return (<div key={item.id} style={{ display: "grid", gridTemplateColumns: "40px 1fr 110px 100px 90px 80px", padding: "10px 16px", borderBottom: "1px solid #1a1a2e", alignItems: "center", opacity: item.active ? 1 : 0.4, background: isEd ? "#16162e" : "transparent", transition: "background 0.15s, opacity 0.2s" }}>
+              <div><div onClick={() => toggleActive(item.id)} style={{ width: 20, height: 20, borderRadius: 4, border: item.active ? `2px solid ${cat.color}` : "2px solid #444", background: item.active ? cat.color + "22" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: cat.color, transition: "all 0.15s" }}>{item.active && "✓"}</div></div>
+              <div>{isEd ? <input value={item.name} onChange={e => updateItem(item.id, "name", e.target.value)} style={{ width: "90%", fontWeight: 500 }} /> : <span style={{ fontSize: 14, fontWeight: 500, textDecoration: item.active ? "none" : "line-through" }}>{item.name}</span>}</div>
+              <div style={{ textAlign: "right" }}>{isEd ? <input type="number" step="0.01" value={item.amount} onChange={e => updateItem(item.id, "amount", e.target.value)} style={{ width: 80, textAlign: "right", fontFamily: "'JetBrains Mono', monospace" }} /> : <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 600 }}>{fmt(monthly)}</span>}</div>
+              <div style={{ textAlign: "center" }}>{isEd ? <select value={item.category} onChange={e => updateItem(item.id, "category", e.target.value)} style={{ fontSize: 11, padding: "3px 6px" }}>{Object.entries(CATEGORIES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select> : <span style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.8, color: cat.color, background: cat.color + "18", padding: "3px 8px", borderRadius: 4 }}>{cat.label}</span>}</div>
+              <div style={{ textAlign: "center" }}>{isEd ? <select value={item.frequency} onChange={e => updateItem(item.id, "frequency", e.target.value)} style={{ fontSize: 12, padding: "3px 6px" }}>{FREQUENCIES.map(f => <option key={f} value={f}>{f}</option>)}</select> : <span style={{ fontSize: 12, color: "#666" }}>{item.frequency}</span>}</div>
+              <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                {isEd ? <button onClick={() => setEditingId(null)} style={{ background: "#2ECC71", color: "#000", padding: "4px 10px", fontSize: 11, fontWeight: 600 }}>Done</button> : (<>
+                  <button onClick={() => setEditingId(item.id)} style={{ background: "#262640", color: "#aaa", padding: "4px 8px", fontSize: 11 }}>Edit</button>
+                  {confirmDelete === item.id ? <button onClick={() => deleteItem(item.id)} style={{ background: "#D44060", color: "#fff", padding: "4px 8px", fontSize: 11, fontWeight: 600 }}>Confirm</button> : <button onClick={() => setConfirmDelete(item.id)} style={{ background: "#2a1520", color: "#D44060", padding: "4px 8px", fontSize: 11 }}>✕</button>}
+                </>)}
+              </div>
+            </div>);
+          })}
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "14px 16px", fontSize: 13, color: "#555577" }}>
+          <span>{activeItems.length} active items &middot; {inactiveItems.length} cancelled</span>
+          <span>Total monthly: <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: "#E8553A" }}>{fmt(totalMonthly)}</span></span>
+        </div>
+
+        <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640", marginTop: 8 }}>
+          <h3 style={{ margin: "0 0 12px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Quick Insights</h3>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13, color: "#aaa" }}>
+            <div><span style={{ color: "#666" }}>Subscriptions & services:</span> <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#9B59B6" }}>{fmt(activeItems.filter(i => !["housing","transport","debt","essentials","financial","health"].includes(i.category)).reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0))}</span><span style={{ color: "#555" }}>/mo</span></div>
+            <div><span style={{ color: "#666" }}>Debt payments:</span> <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#D44060" }}>{fmt(activeItems.filter(i => i.category === "debt").reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0))}</span><span style={{ color: "#555" }}>/mo ({((activeItems.filter(i => i.category === "debt").reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0) / INCOME_NET_MONTHLY) * 100).toFixed(0)}% of income)</span></div>
+            <div><span style={{ color: "#666" }}>Savings rate:</span> <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2ECC71" }}>{((activeItems.filter(i => i.category === "financial").reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0) / INCOME_NET_MONTHLY) * 100).toFixed(1)}%</span></div>
+            <div><span style={{ color: "#666" }}>Free cash after obligations:</span> <span style={{ fontFamily: "'JetBrains Mono', monospace", color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover)}</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UnlockScreen({ onUnlock }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+
+  const handleUnlock = async () => {
+    if (!password) return;
+    setUnlocking(true); setError("");
+    try {
+      const apiKey = await cloudSync.decryptKey(password);
+      const binId = localStorage.getItem("budget_cloud_binid");
+      cloudSync.configure(apiKey, binId);
+      // Verify the key works
+      await cloudSync.load();
+      onUnlock();
+    } catch (e) {
+      setError("Wrong password or corrupted key. Try again.");
+      setUnlocking(false);
+    }
+  };
+
+  const handleKeyDown = (e) => { if (e.key === "Enter") handleUnlock(); };
+
+  const handleReset = () => {
+    if (confirm("This will erase your stored API key. You'll need to set up cloud sync again. Continue?")) {
+      cloudSync.clearConfig();
+      localStorage.removeItem("budget_cloud_skipped");
+      window.location.reload();
+    }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0a18", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ maxWidth: 400, width: "100%", textAlign: "center" }}>
+        <div style={{ fontSize: 48, marginBottom: 16 }}>🔒</div>
+        <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 6, background: "linear-gradient(135deg, #e0e0f0, #8888cc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Budget Command Center</h1>
+        <p style={{ color: "#555577", fontSize: 13, marginBottom: 28 }}>Enter your password to unlock</p>
+        <div style={{ background: "#12121f", borderRadius: 12, padding: 28, border: "1px solid #262640" }}>
+          <input
+            value={password} onChange={e => setPassword(e.target.value)} onKeyDown={handleKeyDown}
+            placeholder="Password" type="password" autoFocus
+            style={{ width: "100%", padding: "12px 14px", fontSize: 16, textAlign: "center", marginBottom: 12, letterSpacing: 2 }}
+          />
+          {error && <div style={{ fontSize: 12, color: "#D44060", marginBottom: 12 }}>{error}</div>}
+          <button onClick={handleUnlock} disabled={!password || unlocking}
+            style={{ background: unlocking ? "#333" : "#3355cc", color: "#fff", padding: "10px 20px", fontWeight: 600, fontSize: 14, width: "100%", opacity: !password ? 0.5 : 1 }}>
+            {unlocking ? "Unlocking..." : "Unlock"}
+          </button>
+          <div style={{ borderTop: "1px solid #262640", marginTop: 20, paddingTop: 14 }}>
+            <button onClick={handleReset} style={{ background: "transparent", color: "#444", fontSize: 11, padding: 0, textDecoration: "underline", textUnderlineOffset: 3 }}>
+              Forgot password? Reset setup
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const needsSetup = !cloudSync.hasEncryptedKey && !localStorage.getItem("budget_cloud_skipped");
+  const needsUnlock = cloudSync.hasEncryptedKey && !cloudSync.isConfigured;
+  const [screen, setScreen] = useState(needsSetup ? "setup" : needsUnlock ? "unlock" : "dashboard");
+
+  if (screen === "setup") return <SetupScreen onComplete={() => setScreen("dashboard")} />;
+  if (screen === "unlock") return <UnlockScreen onUnlock={() => setScreen("dashboard")} />;
+  return <SyncProvider><BudgetDashboard /></SyncProvider>;
+}
+
+ReactDOM.render(<App />, document.getElementById("root"));
+</script>
+</body>
+</html>
