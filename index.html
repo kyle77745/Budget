@@ -9,6 +9,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0a0a18; color: #e0e0f0; font-family: 'DM Sans', 'Segoe UI', sans-serif; }
@@ -247,7 +248,7 @@ function useCloudState(localKey, defaultValue) {
     localStorage.setItem(localKey, JSON.stringify({ _version: STORAGE_VERSION, _data: state }));
     if (cloudSync.isConfigured) {
       const payload = { _version: STORAGE_VERSION, _data: {} };
-      ["budget-items", "budget-debts"].forEach(k => {
+      ["budget-items", "budget-debts", "budget-debt-history", "budget-monthly-snapshots"].forEach(k => {
         try { const raw = localStorage.getItem(k); if (raw) payload._data[k] = JSON.parse(raw)._data ?? JSON.parse(raw); } catch (e) {}
       });
       payload._data[localKey] = state;
@@ -277,8 +278,7 @@ function SyncIndicator() {
   </span>);
 }
 
-function DebtTracker() {
-  const [debts, setDebts] = useCloudState("budget-debts", defaultDebts);
+function DebtTracker({ debts, setDebts }) {
   const [editingDebt, setEditingDebt] = useState(null);
   const [addingDebt, setAddingDebt] = useState(false);
   const [newDebt, setNewDebt] = useState({ name: "", balance: "", payment: "", apr: "" });
@@ -430,8 +430,177 @@ function SetupScreen({ onComplete }) {
   );
 }
 
+function ChartCanvas({ id, renderChart, deps }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = renderChart(canvasRef.current);
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, deps);
+  return <canvas ref={canvasRef} id={id} />;
+}
+
+function CategoryDonut({ categoryTotals, totalMonthly }) {
+  const renderChart = (canvas) => new Chart(canvas, {
+    type: "doughnut",
+    data: {
+      labels: categoryTotals.map(c => c.label),
+      datasets: [{ data: categoryTotals.map(c => c.totalMonthly), backgroundColor: categoryTotals.map(c => c.color), borderColor: "#12121f", borderWidth: 3 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: "65%",
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => `${ctx.label}: ${fmt(ctx.parsed)} (${((ctx.parsed / totalMonthly) * 100).toFixed(0)}%)` }, bodyFont: { family: "'JetBrains Mono'" }, backgroundColor: "#1a1a2e", titleColor: "#aaa", bodyColor: "#eee", borderColor: "#333355", borderWidth: 1 }
+      }
+    }
+  });
+  return (
+    <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+      <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Category Breakdown</h3>
+      <div style={{ display: "flex", gap: 24, alignItems: "center" }}>
+        <div style={{ width: 180, height: 180, flexShrink: 0 }}>
+          <ChartCanvas id="donut" renderChart={renderChart} deps={[JSON.stringify(categoryTotals)]} />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1 }}>
+          {categoryTotals.map(c => (
+            <div key={c.key} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: c.color, flexShrink: 0 }} />
+              <span style={{ fontSize: 12, color: "#aaa", flex: 1 }}>{c.label}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 600, color: c.color }}>{fmt(c.totalMonthly)}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#555", width: 35, textAlign: "right" }}>{((c.totalMonthly / totalMonthly) * 100).toFixed(0)}%</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DebtPaydownChart({ debtHistory, debts }) {
+  const activeDebts = debts.filter(d => d.balance > 0);
+  const totalPayments = activeDebts.reduce((s, d) => s + d.payment, 0);
+  const totalInterest = activeDebts.reduce((s, d) => s + (d.apr ? (d.balance * (d.apr / 100) / 12) : 0), 0);
+  const netReduction = totalPayments - totalInterest;
+  const totalDebt = activeDebts.reduce((s, d) => s + d.balance, 0);
+  const monthsToPayoff = netReduction > 0 ? Math.ceil(totalDebt / netReduction) : null;
+
+  // Build projection data
+  const projectionMonths = monthsToPayoff ? Math.min(monthsToPayoff, 60) : 24;
+  const projectionData = [];
+  let runningBalance = totalDebt;
+  const now = new Date();
+  for (let i = 0; i <= projectionMonths; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+    projectionData.push({ x: d.toLocaleDateString("en-US", { month: "short", year: "2-digit" }), y: Math.max(0, Math.round(runningBalance)) });
+    runningBalance -= netReduction;
+  }
+
+  // Merge history with projection
+  const historyData = debtHistory.map(h => ({ x: new Date(h.date).toLocaleDateString("en-US", { month: "short", year: "2-digit" }), y: h.total }));
+
+  const renderChart = (canvas) => new Chart(canvas, {
+    type: "line",
+    data: {
+      labels: projectionData.map(d => d.x),
+      datasets: [
+        ...(historyData.length > 1 ? [{ label: "Actual", data: historyData, borderColor: "#D44060", backgroundColor: "#D4406020", fill: true, tension: 0.3, pointRadius: 4, pointBackgroundColor: "#D44060", borderWidth: 2 }] : []),
+        { label: "Projected", data: projectionData, borderColor: "#5577ff", backgroundColor: "#5577ff10", fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, borderDash: [6, 4] }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: "#1a1a2e" }, ticks: { color: "#555", font: { size: 10 }, maxRotation: 45 } },
+        y: { grid: { color: "#1a1a2e" }, ticks: { color: "#555", font: { family: "'JetBrains Mono'", size: 10 }, callback: v => "$" + (v / 1000).toFixed(0) + "k" }, beginAtZero: true }
+      },
+      plugins: {
+        legend: { display: historyData.length > 1, labels: { color: "#888", font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` }, bodyFont: { family: "'JetBrains Mono'" }, backgroundColor: "#1a1a2e", titleColor: "#aaa", bodyColor: "#eee", borderColor: "#333355", borderWidth: 1 }
+      }
+    }
+  });
+
+  return (
+    <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
+        <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Debt Paydown Projection</h3>
+        {monthsToPayoff && <span style={{ fontSize: 12, color: "#5577ff" }}>
+          Debt-free in <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>{monthsToPayoff}</span> months
+          <span style={{ color: "#555" }}> ({new Date(now.getFullYear(), now.getMonth() + monthsToPayoff, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" })})</span>
+        </span>}
+        {!monthsToPayoff && totalDebt > 0 && <span style={{ fontSize: 12, color: "#D44060" }}>Add APRs to see payoff date</span>}
+      </div>
+      <div style={{ height: 220 }}>
+        <ChartCanvas id="debtchart" renderChart={renderChart} deps={[JSON.stringify(debtHistory), JSON.stringify(debts)]} />
+      </div>
+      {netReduction > 0 && <div style={{ display: "flex", gap: 24, marginTop: 14, fontSize: 12, color: "#666" }}>
+        <span>Paying <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#aaa" }}>{fmt(totalPayments)}</span>/mo</span>
+        {totalInterest > 0 && <span>Interest eating <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#E8553A" }}>{fmt(totalInterest)}</span>/mo</span>}
+        <span>Net reduction <span style={{ fontFamily: "'JetBrains Mono', monospace", color: "#2ECC71" }}>{fmt(netReduction)}</span>/mo</span>
+      </div>}
+    </div>
+  );
+}
+
+function SnapshotHistory({ snapshots }) {
+  if (snapshots.length < 2) return (
+    <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+      <h3 style={{ margin: "0 0 10px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Monthly Trends</h3>
+      <div style={{ fontSize: 13, color: "#555", lineHeight: 1.6 }}>Snapshots are captured on the 1st of each month. Come back next month to start seeing trends. You have {snapshots.length} snapshot{snapshots.length !== 1 ? "s" : ""} so far.</div>
+    </div>
+  );
+
+  const renderChart = (canvas) => new Chart(canvas, {
+    type: "bar",
+    data: {
+      labels: snapshots.map(s => new Date(s.date).toLocaleDateString("en-US", { month: "short", year: "2-digit" })),
+      datasets: [
+        { label: "Fixed Costs", data: snapshots.map(s => s.totalOutgoing), backgroundColor: "#E8553A88", borderRadius: 4 },
+        { label: "Leftover", data: snapshots.map(s => s.leftover), backgroundColor: "#2ECC7188", borderRadius: 4 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { color: "#555", font: { size: 10 } } },
+        y: { stacked: true, grid: { color: "#1a1a2e" }, ticks: { color: "#555", font: { family: "'JetBrains Mono'", size: 10 }, callback: v => "$" + (v / 1000).toFixed(1) + "k" } }
+      },
+      plugins: {
+        legend: { labels: { color: "#888", font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}` }, bodyFont: { family: "'JetBrains Mono'" }, backgroundColor: "#1a1a2e", titleColor: "#aaa", bodyColor: "#eee", borderColor: "#333355", borderWidth: 1 }
+      }
+    }
+  });
+
+  const latest = snapshots[snapshots.length - 1];
+  const prev = snapshots[snapshots.length - 2];
+  const diff = latest.totalOutgoing - prev.totalOutgoing;
+
+  return (
+    <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
+        <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Monthly Trends</h3>
+        <span style={{ fontSize: 12, color: diff > 0 ? "#E8553A" : "#2ECC71" }}>
+          {diff > 0 ? "↑" : "↓"} {fmt(Math.abs(diff))} vs last month
+        </span>
+      </div>
+      <div style={{ height: 200 }}>
+        <ChartCanvas id="snapshotchart" renderChart={renderChart} deps={[JSON.stringify(snapshots)]} />
+      </div>
+    </div>
+  );
+}
+
 function BudgetDashboard() {
   const [items, setItems] = useCloudState("budget-items", defaultItems);
+  const [debts, setDebts] = useCloudState("budget-debts", defaultDebts);
+  const [debtHistory, setDebtHistory] = useCloudState("budget-debt-history", []);
+  const [snapshots, setSnapshots] = useCloudState("budget-monthly-snapshots", []);
+  const [activeTab, setActiveTab] = useState("budget");
   const [showInactive, setShowInactive] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [addingNew, setAddingNew] = useState(false);
@@ -441,6 +610,60 @@ function BudgetDashboard() {
   const [sortBy, setSortBy] = useState("category");
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+
+  // ── Debt ↔ Budget sync: when debt payment changes, update matching budget items
+  const DEBT_BUDGET_MAP = { "Capital One": "Credit Card Payments", "Apple Card": "Credit Card Payments", "Partners": "Credit Card Payments", "Citi": "Credit Card Payments", "OneMain": "OneMain", "Consolidated Debt": "Consolidated Debt" };
+  
+  useEffect(() => {
+    // Sync individual debt items that have direct budget counterparts
+    const directMatches = { "OneMain": "OneMain" };
+    let changed = false;
+    let newItems = [...items];
+    debts.forEach(d => {
+      // Try exact name match first
+      const budgetIdx = newItems.findIndex(i => i.name === d.name && i.category === "debt");
+      if (budgetIdx !== -1 && newItems[budgetIdx].amount !== d.payment) {
+        newItems[budgetIdx] = { ...newItems[budgetIdx], amount: d.payment };
+        changed = true;
+      }
+    });
+    // Sync aggregate "Credit Card Payments" with sum of CC debts
+    const ccNames = ["Capital One", "Apple Card", "Partners", "Citi"];
+    const ccTotal = debts.filter(d => ccNames.includes(d.name) && d.balance > 0).reduce((s, d) => s + d.payment, 0);
+    const ccIdx = newItems.findIndex(i => i.name === "Credit Card Payments" && i.category === "debt");
+    if (ccIdx !== -1 && ccTotal > 0 && newItems[ccIdx].amount !== ccTotal) {
+      newItems[ccIdx] = { ...newItems[ccIdx], amount: ccTotal };
+      changed = true;
+    }
+    if (changed) setItems(newItems);
+  }, [debts]);
+
+  // ── Auto-capture monthly snapshot on 1st of month (or first visit that month)
+  useEffect(() => {
+    const now = new Date();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const alreadyCaptured = snapshots.some(s => s.month === monthKey);
+    if (!alreadyCaptured && items.length > 0) {
+      const activeOnly = items.filter(i => i.active);
+      const total = activeOnly.reduce((s, i) => s + toMonthly(i.amount, i.frequency), 0);
+      const catTotals = {};
+      activeOnly.forEach(i => { if (!catTotals[i.category]) catTotals[i.category] = 0; catTotals[i.category] += toMonthly(i.amount, i.frequency); });
+      setSnapshots(prev => [...prev, { month: monthKey, date: now.toISOString(), totalOutgoing: total, leftover: INCOME_NET_MONTHLY - total, categories: catTotals, itemCount: activeOnly.length }]);
+    }
+  }, [items]);
+
+  // ── Record debt balance snapshot (once per month)
+  useEffect(() => {
+    const now = new Date();
+    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const alreadyRecorded = debtHistory.some(h => h.month === monthKey);
+    if (!alreadyRecorded && debts.length > 0) {
+      const totalDebt = debts.filter(d => d.balance > 0).reduce((s, d) => s + d.balance, 0);
+      if (totalDebt > 0) {
+        setDebtHistory(prev => [...prev, { month: monthKey, date: now.toISOString(), total: totalDebt, balances: debts.filter(d => d.balance > 0).map(d => ({ name: d.name, balance: d.balance })) }]);
+      }
+    }
+  }, [debts]);
 
   const activeItems = useMemo(() => items.filter(i => i.active), [items]);
   const inactiveItems = useMemo(() => items.filter(i => !i.active), [items]);
@@ -471,7 +694,8 @@ function BudgetDashboard() {
 
   const resetAllData = () => {
     localStorage.removeItem("budget-items"); localStorage.removeItem("budget-debts");
-    if (cloudSync.isConfigured) cloudSync.save({ _version: STORAGE_VERSION, _data: { "budget-items": defaultItems, "budget-debts": defaultDebts } }).catch(console.error);
+    localStorage.removeItem("budget-debt-history"); localStorage.removeItem("budget-monthly-snapshots");
+    if (cloudSync.isConfigured) cloudSync.save({ _version: STORAGE_VERSION, _data: { "budget-items": defaultItems, "budget-debts": defaultDebts, "budget-debt-history": [], "budget-monthly-snapshots": [] } }).catch(console.error);
     window.location.reload();
   };
 
@@ -512,6 +736,19 @@ function BudgetDashboard() {
           <div style={{ background: "#12121f", borderRadius: 10, padding: "18px 20px", border: leftover >= 0 ? "1px solid #262640" : "1px solid #D44060" }}><div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688", marginBottom: 6 }}>Leftover</div><div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover)}</div></div>
         </div>
 
+        {/* Tab Navigation */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 20, background: "#0e0e1a", borderRadius: 8, padding: 4 }}>
+          {[["budget", "Budget & Debt"], ["insights", "Insights & Trends"]].map(([key, label]) => (
+            <button key={key} onClick={() => setActiveTab(key)} style={{
+              flex: 1, padding: "10px 16px", fontWeight: 600, fontSize: 13,
+              background: activeTab === key ? "#1a1a2e" : "transparent",
+              color: activeTab === key ? "#e0e0f0" : "#555577",
+              borderRadius: 6, transition: "all 0.15s",
+            }}>{label}</button>
+          ))}
+        </div>
+
+        {activeTab === "budget" && <>
         <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640", marginBottom: 12 }}>
           <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>Spending Breakdown (Weekly)</h3>
           <BarSegment segments={barSegments} total={weeklyIncome} />
@@ -523,7 +760,7 @@ function BudgetDashboard() {
           </div>
         </div>
 
-        <div style={{ marginBottom: 20 }}><DebtTracker /></div>
+        <div style={{ marginBottom: 20 }}><DebtTracker debts={debts} setDebts={setDebts} /></div>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
           <button onClick={() => setAddingNew(true)} style={{ background: "#3355cc", color: "#fff", padding: "8px 16px", fontWeight: 600 }}>+ Add Item</button>
@@ -576,6 +813,37 @@ function BudgetDashboard() {
             <div><span style={{ color: "#666" }}>Free cash after obligations:</span> <span style={{ fontFamily: "'JetBrains Mono', monospace", color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover)}</span></div>
           </div>
         </div>
+        </>}
+
+        {activeTab === "insights" && <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <CategoryDonut categoryTotals={categoryTotals} totalMonthly={totalMonthly} />
+            <DebtPaydownChart debtHistory={debtHistory} debts={debts} />
+            <SnapshotHistory snapshots={snapshots} />
+
+            {/* Leftover context */}
+            <div style={{ background: "#12121f", borderRadius: 10, padding: "20px 24px", border: "1px solid #262640" }}>
+              <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 600, textTransform: "uppercase", letterSpacing: 1.5, color: "#666688" }}>What Your Leftover Really Means</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, textAlign: "center" }}>
+                <div>
+                  <div style={{ fontSize: 11, color: "#666", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>Monthly</div>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover)}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: "#666", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>Weekly</div>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover * 12 / 52)}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: "#666", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>Daily</div>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, fontWeight: 700, color: leftover >= 0 ? "#2ECC71" : "#D44060" }}>{fmt(leftover / 30)}</div>
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: "#555", textAlign: "center", marginTop: 12 }}>
+                This is your daily spending budget after all recurring expenses and debts are covered.
+              </div>
+            </div>
+          </div>
+        </>}
       </div>
     </div>
   );
