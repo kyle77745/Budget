@@ -127,6 +127,7 @@ const CRYPTO = {
 };
 
 const STORAGE_VERSION = 1;
+const APP_VERSION = "1.3.0";
 const migrations = {};
 function migrateData(data, fromVersion) {
   let current = data;
@@ -269,12 +270,12 @@ function BarSegment({ segments, total }) {
 
 function SyncIndicator() {
   const { syncStatus } = useContext(SyncContext);
-  if (!cloudSync.isConfigured) return (<span style={{ fontSize: 11, color: "#F0943A", display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: "#F0943A", display: "inline-block" }} />Local only</span>);
+  if (!cloudSync.isConfigured) return (<span style={{ fontSize: 11, color: "#F0943A", display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: "#F0943A", display: "inline-block" }} />Local only &middot; v{APP_VERSION}</span>);
   const colors = { idle: "#666", syncing: "#5577ff", synced: "#2ECC71", error: "#D44060", offline: "#F0943A" };
   const labels = { idle: "Connected", syncing: "Syncing...", synced: "Synced", error: "Sync error", offline: "Offline" };
   return (<span style={{ fontSize: 11, color: colors[syncStatus], display: "flex", alignItems: "center", gap: 4 }} title={cloudSync.binId ? `Bin: ${cloudSync.binId}` : ""}>
     {syncStatus === "syncing" ? <span style={{ width: 10, height: 10, border: "2px solid #5577ff", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "spin 0.8s linear infinite" }} /> : <span style={{ width: 6, height: 6, borderRadius: "50%", background: colors[syncStatus], display: "inline-block" }} />}
-    🔐 {labels[syncStatus]} &middot; v{STORAGE_VERSION}
+    🔐 {labels[syncStatus]} &middot; v{APP_VERSION}
   </span>);
 }
 
@@ -612,30 +613,31 @@ function BudgetDashboard() {
   const [showSettings, setShowSettings] = useState(false);
 
   // ── Debt ↔ Budget sync: when debt payment changes, update matching budget items
-  const DEBT_BUDGET_MAP = { "Capital One": "Credit Card Payments", "Apple Card": "Credit Card Payments", "Partners": "Credit Card Payments", "Citi": "Credit Card Payments", "OneMain": "OneMain", "Consolidated Debt": "Consolidated Debt" };
-  
   useEffect(() => {
-    // Sync individual debt items that have direct budget counterparts
-    const directMatches = { "OneMain": "OneMain" };
-    let changed = false;
-    let newItems = [...items];
-    debts.forEach(d => {
-      // Try exact name match first
-      const budgetIdx = newItems.findIndex(i => i.name === d.name && i.category === "debt");
-      if (budgetIdx !== -1 && newItems[budgetIdx].amount !== d.payment) {
-        newItems[budgetIdx] = { ...newItems[budgetIdx], amount: d.payment };
+    setItems(prevItems => {
+      const ccNames = ["Capital One", "Apple Card", "Partners", "Citi"];
+      let newItems = [...prevItems];
+      let changed = false;
+
+      // Sync individual debt items with exact name match in budget
+      debts.forEach(d => {
+        const budgetIdx = newItems.findIndex(i => i.name === d.name && i.category === "debt");
+        if (budgetIdx !== -1 && newItems[budgetIdx].amount !== d.payment) {
+          newItems[budgetIdx] = { ...newItems[budgetIdx], amount: d.payment };
+          changed = true;
+        }
+      });
+
+      // Sync aggregate "Credit Card Payments" with sum of CC debts
+      const ccTotal = debts.filter(d => ccNames.includes(d.name) && d.balance > 0).reduce((s, d) => s + d.payment, 0);
+      const ccIdx = newItems.findIndex(i => i.name === "Credit Card Payments" && i.category === "debt");
+      if (ccIdx !== -1 && ccTotal > 0 && newItems[ccIdx].amount !== ccTotal) {
+        newItems[ccIdx] = { ...newItems[ccIdx], amount: ccTotal };
         changed = true;
       }
+
+      return changed ? newItems : prevItems;
     });
-    // Sync aggregate "Credit Card Payments" with sum of CC debts
-    const ccNames = ["Capital One", "Apple Card", "Partners", "Citi"];
-    const ccTotal = debts.filter(d => ccNames.includes(d.name) && d.balance > 0).reduce((s, d) => s + d.payment, 0);
-    const ccIdx = newItems.findIndex(i => i.name === "Credit Card Payments" && i.category === "debt");
-    if (ccIdx !== -1 && ccTotal > 0 && newItems[ccIdx].amount !== ccTotal) {
-      newItems[ccIdx] = { ...newItems[ccIdx], amount: ccTotal };
-      changed = true;
-    }
-    if (changed) setItems(newItems);
   }, [debts]);
 
   // ── Auto-capture monthly snapshot on 1st of month (or first visit that month)
